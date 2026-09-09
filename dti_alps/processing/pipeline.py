@@ -289,11 +289,14 @@ class PipelineRunner:
         with open(index_path, "w") as f:
             f.write(" ".join(["1"] * n_volumes))
 
-        # Build and run eddy command
+        # Build and run eddy command. Which eddy build to run is our decision,
+        # made the way dwifslpreproc makes it on the standard route: try the
+        # CUDA build if one is installed, and fall back to the CPU build if it
+        # fails. (FSL's own `eddy` wrapper decides by parsing nvidia-smi, and a
+        # driver-side label change silently demotes it to CPU.)
         eddy_output = self.state.get_output_path("dwi_preproc").replace(".nii.gz", "")
 
-        eddy_cmd = [
-            "eddy",
+        eddy_args = [
             f"--imain={dwi_input}",
             f"--mask={mask_path}",
             f"--acqp={acqparams_path}",
@@ -309,11 +312,28 @@ class PipelineRunner:
         eddy_options = self.state.synb0_eddy_options or {}
         for opt, val in eddy_options.items():
             if val is True:
-                eddy_cmd.append(f"--{opt}")
+                eddy_args.append(f"--{opt}")
             elif val is not False and val is not None:
-                eddy_cmd.append(f"--{opt}={val}")
+                eddy_args.append(f"--{opt}={val}")
 
-        if not self._run_command(eddy_cmd, "eddy"):
+        cuda_eddy, cpu_eddy = commands.resolve_eddy_binaries()
+        attempts = [binary for binary in (cuda_eddy, cpu_eddy) if binary is not None]
+        if not attempts:
+            self._log("ERROR: no eddy executable found on PATH")
+            self._update_stage("eddy", "failed")
+            return False
+        if cuda_eddy is None:
+            self._log(f"  No CUDA eddy build found; using {cpu_eddy}")
+
+        for attempt, binary in enumerate(attempts):
+            if self._run_command([binary, *eddy_args], "eddy"):
+                break
+            if self.cancelled:
+                self._update_stage("eddy", "failed")
+                return False
+            if attempt + 1 < len(attempts):
+                self._log(f"  {binary} failed; retrying with CPU build {attempts[attempt + 1]}")
+        else:
             self._log("ERROR: eddy failed")
             self._update_stage("eddy", "failed")
             return False
