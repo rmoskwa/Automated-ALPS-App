@@ -383,6 +383,55 @@ def _find_any(variants: list[str]) -> bool:
     return any(shutil.which(variant) is not None for variant in variants)
 
 
+# CPU eddy builds, in preference order. FSL >= 6.0.6 ships ``eddy_cpu``; older
+# releases shipped ``eddy_openmp``. Bare ``eddy`` is FSL's own Python dispatcher,
+# which may itself pick a GPU build -- it is the last resort, not a CPU guarantee.
+_EDDY_CPU_CANDIDATES = ["eddy_cpu", "eddy_openmp", "eddy"]
+
+
+def resolve_eddy_binaries() -> tuple[str | None, str | None]:
+    """
+    Return ``(cuda, cpu)``: the eddy programs on PATH to try, in that order.
+
+    Mirrors MRtrix3's ``dwifslpreproc`` selection so the two preprocessing routes
+    make the same choice on the same machine:
+
+    - CUDA: an explicit ``eddy_cuda`` (a user's soft-link override) wins; otherwise
+      the highest-versioned ``eddy_cudaX.Y`` anywhere on PATH.
+    - CPU: the first of ``eddy_cpu``, ``eddy_openmp``, ``eddy``.
+
+    We deliberately do *not* defer to FSL's ``eddy`` wrapper for the GPU decision.
+    It parses ``nvidia-smi`` for a ``CUDA Version:`` label, and NVIDIA driver
+    releases have changed that label, at which point the wrapper silently falls
+    back to the CPU build on a machine whose GPU build runs fine. Selecting the
+    binary ourselves and letting the run itself prove the GPU works is what
+    ``dwifslpreproc`` does; either value may be ``None`` when nothing resolves.
+    """
+    import os
+    import shutil
+
+    cuda: str | None = None
+    if shutil.which("eddy_cuda") is not None:
+        cuda = "eddy_cuda"
+    else:
+        best_version = -1.0
+        for directory in os.environ.get("PATH", "").split(os.pathsep):
+            if not os.path.isdir(directory):
+                continue
+            for entry in os.listdir(directory):
+                if not entry.startswith("eddy_cuda"):
+                    continue
+                try:
+                    version = float(entry[len("eddy_cuda") :])
+                except ValueError:
+                    continue
+                if version > best_version and shutil.which(entry) is not None:
+                    best_version, cuda = version, entry
+
+    cpu = next((c for c in _EDDY_CPU_CANDIDATES if shutil.which(c) is not None), None)
+    return cuda, cpu
+
+
 def check_mrtrix3_available(use_synb0: bool = False) -> tuple[bool, list[str]]:
     """
     Check that the MRtrix3 commands this engine invokes are on PATH.
@@ -427,11 +476,14 @@ def check_fsl_available(use_synb0: bool = False) -> tuple[bool, list[str]]:
     """
     required = _FSL_COMMANDS + (_FSL_SYNB0_EXTRA if use_synb0 else [])
 
-    missing = [
-        cmd
-        for cmd in required
-        if not _find_any([tpl.format(cmd=cmd) for tpl in _FSL_VARIANT_TEMPLATES])
-    ]
+    def _present(cmd: str) -> bool:
+        # eddy is the one command we choose a build for ourselves, so preflight
+        # must accept exactly what the run will accept (e.g. ``eddy_cuda10.2``).
+        if cmd == "eddy":
+            return any(resolve_eddy_binaries())
+        return _find_any([tpl.format(cmd=cmd) for tpl in _FSL_VARIANT_TEMPLATES])
+
+    missing = [cmd for cmd in required if not _present(cmd)]
     return (len(missing) == 0, missing)
 
 
